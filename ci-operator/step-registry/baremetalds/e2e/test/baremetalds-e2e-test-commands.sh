@@ -156,6 +156,12 @@ function run_mirror_release_image_for_disconnected_upgrade_ssh_commands() {
       ssh "${SSHOPTS[@]}" "root@${IP}" bash -ux - << EOF
 set -o pipefail
 
+export KUBECONFIG=\$(ls /root/dev-scripts/ocp/*/auth/kubeconfig)
+if [ ! -f "\${KUBECONFIG}" ]; then
+  echo "ERROR: kubeconfig not found at \${KUBECONFIG}"
+  exit 1
+fi
+
 MIRRORED_RELEASE_IMAGE=${DS_REGISTRY}/localimages/local-upgrade-image
 DIGEST=\$(oc adm release info --registry-config ${DS_WORKING_DIR}/pull_secret.json ${OPENSHIFT_UPGRADE_RELEASE_IMAGE_OVERRIDE} --output=jsonpath="{.digest}")
 RELEASE_TAG=\$(sed -e "s/^sha256://" <<< \${DIGEST})
@@ -167,12 +173,20 @@ MIRRORCOMMAND="oc adm release mirror --registry-config ${DS_WORKING_DIR}/pull_se
   --to=\${MIRRORED_RELEASE_IMAGE} \
   --to-release-image=\${MIRRORED_RELEASE_IMAGE}:\${RELEASE_TAG}"
 
-# We run this first in dry-mode to get the ImageContentSourcePolicy and apply it early
-# So we don't have to wait as long for the machine-config to be applied after we do the mirroring
-\$MIRRORCOMMAND --dry-run 2>&1 | tee \${MIRROR_RESULT_LOG}
+# Run in dry-mode first to get the ImageContentSourcePolicy and apply it early
+# so we don't have to wait as long for the machine-config to be applied after mirroring.
+# Explicitly request icsp format since the default may change in future oc versions.
+\$MIRRORCOMMAND --dry-run --print-mirror-instructions=icsp 2>&1 | tee \${MIRROR_RESULT_LOG}
 
 echo "Create ImageContentSourcePolicy to use mirrored registry in upgrade"
 UPGRADE_ICS=\$(cat \${MIRROR_RESULT_LOG} | sed -n '/repositoryDigestMirrors/,//p')
+
+if [ -z "\${UPGRADE_ICS}" ]; then
+  echo "ERROR: failed to extract repositoryDigestMirrors from dry-run output"
+  echo "Dry-run log contents:"
+  cat \${MIRROR_RESULT_LOG}
+  exit 1
+fi
 
 cat <<EOF1 | oc apply -f -
 apiVersion: operator.openshift.io/v1alpha1
@@ -182,6 +196,12 @@ metadata:
 spec:
 \${UPGRADE_ICS}
 EOF1
+
+if ! oc get imagecontentsourcepolicy disconnected-upgrade-ics; then
+  echo "ERROR: ICSP disconnected-upgrade-ics was not created"
+  exit 1
+fi
+echo "ICSP disconnected-upgrade-ics applied successfully"
 
 #Retry logic for the real release mirror command
 MAX_RETRIES=3
